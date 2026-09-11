@@ -321,16 +321,28 @@ def ask_groq(client, model, context, question, patient_context=""):
 # ---------------------------------------------------------------------
 st.sidebar.header("⚙️ Settings")
 
-default_key = os.getenv("GROQ_API_KEY", "")
+# Look for a key stored server-side (Streamlit Cloud "Secrets" or an
+# environment variable). If found, use it silently — visitors never see
+# an API key field at all. This is how you share the app with friends
+# without ever asking them for a key or exposing yours.
+_secret_key = None
 try:
-    default_key = st.secrets.get("GROQ_API_KEY", default_key)
+    _secret_key = st.secrets.get("GROQ_API_KEY", None)
 except Exception:
     pass
+_env_key = os.getenv("GROQ_API_KEY", "")
+_builtin_key = _secret_key or _env_key or ""
 
-groq_api_key = st.sidebar.text_input(
-    "Groq API Key", type="password", value=default_key,
-    help="Get a free key at https://console.groq.com/keys"
-)
+if _builtin_key:
+    groq_api_key = _builtin_key
+    st.sidebar.success("✅ Using the app's built-in API key — no key needed from you.")
+else:
+    # Fallback for local development only, when no secret is configured yet.
+    groq_api_key = st.sidebar.text_input(
+        "Groq API Key", type="password",
+        help="No built-in key found. Get a free key at https://console.groq.com/keys "
+             "or, better, add it to Streamlit Cloud's Secrets so visitors never see this field."
+    )
 
 if "available_models" not in st.session_state:
     st.session_state.available_models = FALLBACK_MODELS
