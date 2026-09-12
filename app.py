@@ -546,9 +546,9 @@ with tab1:
             with st.spinner("Extracting text (with OCR fallback if needed) and building index..."):
                 suffix = uploaded_file.name.lower().split(".")[-1]
                 if suffix == "pdf":
-                    raw_text = extract_text_from_pdf(uploaded_file)
+                    line_text, raw_text = extract_text_from_pdf(uploaded_file)
                 else:
-                    raw_text = extract_text_from_image_file(uploaded_file)
+                    line_text, raw_text = extract_text_from_image_file(uploaded_file)
 
                 if not raw_text or len(raw_text.strip()) < 5:
                     st.error("Could not extract any readable text from this file. Try a clearer photo/scan, or use manual entry instead.")
