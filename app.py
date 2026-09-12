@@ -238,10 +238,10 @@ def fetch_live_models(api_key: str):
 # ---------------------------------------------------------------------
 # OCR HELPERS
 # ---------------------------------------------------------------------
-def ocr_image(image: Image.Image, psm: int = 6) -> str:
+def ocr_image(image: Image.Image) -> str:
     """Run Tesseract OCR on a PIL image. Returns '' on failure with a UI warning."""
     try:
-        return pytesseract.image_to_string(image, config=f"--psm {psm}")
+        return pytesseract.image_to_string(image)
     except Exception as e:
         st.error(
             "OCR failed — Tesseract may not be installed in this environment. "
@@ -250,35 +250,25 @@ def ocr_image(image: Image.Image, psm: int = 6) -> str:
         return ""
 
 
-def extract_text_from_pdf(uploaded_file):
-    """
-    Extract text from a PDF, page by page. For each page, run BOTH native
-    text extraction and OCR, then keep whichever result is longer — this
-    protects against pages where a hidden/partial text layer exists but
-    is far less complete than what OCR can read off the rendered image.
-    Returns (line_preserving_text, cleaned_single_line_text).
-    """
+def extract_text_from_pdf(uploaded_file) -> str:
+    """Extract text from a PDF. Falls back to OCR page-by-page for scanned pages."""
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    page_texts = []
+    parts = []
     for page in doc:
-        native_text = page.get_text()
-        pix = page.get_pixmap(dpi=300)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        ocr_text = ocr_image(img)
-        # Keep whichever extraction actually captured more content
-        page_texts.append(native_text if len(native_text.strip()) >= len(ocr_text.strip()) else ocr_text)
+        page_text = page.get_text()
+        if len(page_text.strip()) < 20:  # likely a scanned/image-only page
+            pix = page.get_pixmap(dpi=200)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_text = ocr_image(img)
+        parts.append(page_text)
     doc.close()
-    line_text = "\n".join(page_texts).strip()
-    cleaned_text = re.sub(r"\s+", " ", line_text).strip()
-    return line_text, cleaned_text
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
 
-def extract_text_from_image_file(uploaded_file):
+def extract_text_from_image_file(uploaded_file) -> str:
     """Extract text from a photo/scan (JPG/PNG) via OCR."""
     image = Image.open(uploaded_file).convert("RGB")
-    line_text = ocr_image(image).strip()
-    cleaned_text = re.sub(r"\s+", " ", line_text).strip()
-    return line_text, cleaned_text
+    return re.sub(r"\s+", " ", ocr_image(image)).strip()
 
 
 # ---------------------------------------------------------------------
@@ -311,20 +301,13 @@ def extract_patient_info(text: str) -> dict:
         if m:
             info["gender"] = m.group(1)
 
-    # Conservative name extraction: OCR often places the next field (for example
-    # "Sample Date") on the same line as the name. Stop at common report labels.
     m = re.search(
-        r"(?:patient\s*name|name\s*of\s*patient|\bname)\s*[:\-]\s*"
-        r"([A-Za-z][A-Za-z.'\- ]{1,60}?)(?=\s+(?:sample\s+date|report\s+date|date|dob|age|sex|gender|patient\s*id|mrn|lab\s*no\.?|accession)\s*[:\-]?\b|$)",
+        r"(?:patient\s*name|name\s*of\s*patient|name)\s*[:\-]\s*([A-Za-z.'\- ]{2,50})",
         text, re.IGNORECASE,
     )
     if m:
-        candidate = m.group(1).strip(" .:-")
-        candidate = re.split(
-            r"\s+(?:sample\s+date|report\s+date|date|dob|age|sex|gender|"
-            r"patient\s*id|mrn|lab\s*no\.?|accession)\b",
-            candidate, maxsplit=1, flags=re.IGNORECASE,
-        )[0].strip(" .:-")
+        candidate = m.group(1).strip()
+        candidate = re.split(r"\s{2,}", candidate)[0].strip()
         if candidate:
             info["name"] = candidate
 
@@ -529,13 +512,7 @@ def build_patient_context_str() -> str:
 # ---------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------
-for _k, _v in {
-    "chunks": [],
-    "index": None,
-    "manual_summary": "",
-    "process_message": "",
-    "analysis_answer": "",
-}.items():
+for _k, _v in {"chunks": [], "index": None, "manual_summary": "", "process_message": ""}.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -559,9 +536,9 @@ with tab1:
             with st.spinner("Extracting text (with OCR fallback if needed) and building index..."):
                 suffix = uploaded_file.name.lower().split(".")[-1]
                 if suffix == "pdf":
-                    line_text, raw_text = extract_text_from_pdf(uploaded_file)
+                    raw_text = extract_text_from_pdf(uploaded_file)
                 else:
-                    line_text, raw_text = extract_text_from_image_file(uploaded_file)
+                    raw_text = extract_text_from_image_file(uploaded_file)
 
                 if not raw_text or len(raw_text.strip()) < 5:
                     st.error("Could not extract any readable text from this file. Try a clearer photo/scan, or use manual entry instead.")
@@ -575,34 +552,6 @@ with tab1:
                     # Queue it — applied at the top of the script on the
                     # next run, before the Patient Context widgets exist.
                     st.session_state.pending_detected = detected
-
-                    # Run the default interpretation immediately after processing
-                    # so the user does not have to click a second Analyze button.
-                    st.session_state.analysis_answer = ""
-                    default_question = (
-                        "Please explain these lab results in simple terms, identify "
-                        "which values appear abnormal or noteworthy, and explain what "
-                        "those findings could generally indicate. Do not diagnose or "
-                        "recommend specific treatment or medication doses."
-                    )
-                    if groq_api_key:
-                        try:
-                            relevant = retrieve_relevant_chunks(
-                                default_question, index, chunks, embedder, k=4
-                            )
-                            context = "\n---\n".join(relevant)
-                            client = get_groq_client(groq_api_key)
-                            st.session_state.analysis_answer = ask_groq(
-                                client,
-                                model_choice,
-                                context,
-                                default_question,
-                                build_patient_context_str(),
-                            )
-                        except Exception as e:
-                            st.session_state.analysis_answer = (
-                                f"Unable to generate the interpretation automatically: {e}"
-                            )
 
                     if detected:
                         found = ", ".join(f"{k.title()}: {v}" for k, v in detected.items())
@@ -619,13 +568,6 @@ with tab1:
 
     if st.session_state.chunks:
         st.markdown("---")
-
-        # Show the automatic interpretation immediately after processing.
-        if st.session_state.analysis_answer:
-            st.markdown("### 🧾 Interpretation")
-            st.markdown(st.session_state.analysis_answer)
-            st.markdown("---")
-
         question = st.text_area(
             "Ask a question about this report",
             value="Please explain these lab results in simple terms and flag any values that look abnormal.",
