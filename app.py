@@ -529,7 +529,13 @@ def build_patient_context_str() -> str:
 # ---------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------
-for _k, _v in {"chunks": [], "index": None, "manual_summary": "", "process_message": ""}.items():
+for _k, _v in {
+    "chunks": [],
+    "index": None,
+    "manual_summary": "",
+    "process_message": "",
+    "analysis_answer": "",
+}.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -570,6 +576,34 @@ with tab1:
                     # next run, before the Patient Context widgets exist.
                     st.session_state.pending_detected = detected
 
+                    # Run the default interpretation immediately after processing
+                    # so the user does not have to click a second Analyze button.
+                    st.session_state.analysis_answer = ""
+                    default_question = (
+                        "Please explain these lab results in simple terms, identify "
+                        "which values appear abnormal or noteworthy, and explain what "
+                        "those findings could generally indicate. Do not diagnose or "
+                        "recommend specific treatment or medication doses."
+                    )
+                    if groq_api_key:
+                        try:
+                            relevant = retrieve_relevant_chunks(
+                                default_question, index, chunks, embedder, k=4
+                            )
+                            context = "\n---\n".join(relevant)
+                            client = get_groq_client(groq_api_key)
+                            st.session_state.analysis_answer = ask_groq(
+                                client,
+                                model_choice,
+                                context,
+                                default_question,
+                                build_patient_context_str(),
+                            )
+                        except Exception as e:
+                            st.session_state.analysis_answer = (
+                                f"Unable to generate the interpretation automatically: {e}"
+                            )
+
                     if detected:
                         found = ", ".join(f"{k.title()}: {v}" for k, v in detected.items())
                         st.session_state.process_message = (
@@ -585,6 +619,13 @@ with tab1:
 
     if st.session_state.chunks:
         st.markdown("---")
+
+        # Show the automatic interpretation immediately after processing.
+        if st.session_state.analysis_answer:
+            st.markdown("### 🧾 Interpretation")
+            st.markdown(st.session_state.analysis_answer)
+            st.markdown("---")
+
         question = st.text_area(
             "Ask a question about this report",
             value="Please explain these lab results in simple terms and flag any values that look abnormal.",
