@@ -1,27 +1,41 @@
 """
 AI-Powered Laboratory Diagnostics & Result Interpretation System
 ------------------------------------------------------------------
-- Upload a lab report PDF (or enter values manually from 100+ standard tests)
-- PDF text is extracted (PyMuPDF), chunked, embedded (sentence-transformers)
-  and stored in a local FAISS vector index (fully open-source, no paid DB)
-- Relevant chunks + patient context (age/sex/fasting/history) are sent
-  along with the question to a free/open-weight model hosted on Groq
+- Upload a lab report as PDF or image (JPG/PNG) — or enter values manually
+  from 100+ standard tests
+- Text is extracted via PyMuPDF (text-based PDFs) with automatic OCR
+  fallback (Tesseract, via pytesseract) for scanned PDFs and photos
+- Patient details (name, age, sex) are auto-detected from the document
+  where possible and pre-filled — always shown for the user to verify/edit
+- Text is chunked, embedded locally (sentence-transformers), stored in a
+  local FAISS vector index (fully open-source, no paid DB)
+- Relevant chunks + patient context are sent to a free/open-weight model
+  hosted on Groq for a plain-language interpretation
 
 IMPORTANT: This tool is for educational/informational purposes only.
 It does NOT provide medical diagnosis and is not a substitute for
 professional medical advice. Always consult a qualified clinician.
 
 Reference ranges are compiled from widely-published, standard adult
-clinical reference intervals (the kind printed by most hospital labs).
-Exact cutoffs vary by laboratory, analyzer, and method — always defer
-to the reference range printed on the actual report.
+clinical reference intervals. Exact cutoffs vary by laboratory, analyzer,
+and method — always defer to the range printed on the actual report.
+
+SETUP NOTE (OCR): OCR requires the Tesseract binary in addition to the
+`pytesseract` Python package. Locally: install it via your OS package
+manager (e.g. `brew install tesseract` / `apt install tesseract-ocr` /
+Windows installer). On Streamlit Community Cloud: add a `packages.txt`
+file (next to requirements.txt) containing the single line
+`tesseract-ocr` so the cloud environment installs the binary too.
 """
 
 import os
 import re
+import io
 import numpy as np
 import streamlit as st
 import fitz  # PyMuPDF
+from PIL import Image
+import pytesseract
 from sentence_transformers import SentenceTransformer
 import faiss
 from groq import Groq
@@ -45,8 +59,6 @@ st.warning(
 
 # ---------------------------------------------------------------------
 # REFERENCE RANGES — 100+ tests across standard clinical categories
-# General adult values; many labs show slightly different cutoffs
-# depending on method/analyzer, so treat these as a starting reference.
 # ---------------------------------------------------------------------
 REFERENCE_RANGES = {
     "Hematology": {
@@ -196,7 +208,6 @@ TOTAL_TEST_COUNT = len(FLAT_TESTS)
 # ---------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading embedding model...")
 def load_embedder():
-    # Free, open-source, runs locally — no API key needed
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
@@ -204,21 +215,16 @@ def get_groq_client(api_key: str):
     return Groq(api_key=api_key)
 
 
-# Known-good free/open-weight chat models on Groq as of Sept 2026.
-# Groq periodically deprecates models — see console.groq.com/docs/models.
-# The app also tries to fetch the live list below (best-effort).
 FALLBACK_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "qwen/qwen3.6-27b",
     "groq/compound-mini",
 ]
-
 EXCLUDE_SUBSTRINGS = ["whisper", "tts", "guard", "prompt-guard", "orpheus"]
 
 
 def fetch_live_models(api_key: str):
-    """Best-effort fetch of currently active chat-capable Groq models."""
     try:
         client = get_groq_client(api_key)
         models = client.models.list()
@@ -230,17 +236,97 @@ def fetch_live_models(api_key: str):
 
 
 # ---------------------------------------------------------------------
-# PDF -> TEXT -> CHUNKS -> EMBEDDINGS -> FAISS INDEX
+# OCR HELPERS
 # ---------------------------------------------------------------------
+def ocr_image(image: Image.Image) -> str:
+    """Run Tesseract OCR on a PIL image. Returns '' on failure with a UI warning."""
+    try:
+        return pytesseract.image_to_string(image)
+    except Exception as e:
+        st.error(
+            "OCR failed — Tesseract may not be installed in this environment. "
+            f"Details: {e}\n\nSee the setup note at the top of app.py."
+        )
+        return ""
+
+
 def extract_text_from_pdf(uploaded_file) -> str:
+    """Extract text from a PDF. Falls back to OCR page-by-page for scanned pages."""
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    text = ""
+    parts = []
     for page in doc:
-        text += page.get_text()
+        page_text = page.get_text()
+        if len(page_text.strip()) < 20:  # likely a scanned/image-only page
+            pix = page.get_pixmap(dpi=200)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_text = ocr_image(img)
+        parts.append(page_text)
     doc.close()
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
 
+def extract_text_from_image_file(uploaded_file) -> str:
+    """Extract text from a photo/scan (JPG/PNG) via OCR."""
+    image = Image.open(uploaded_file).convert("RGB")
+    return re.sub(r"\s+", " ", ocr_image(image)).strip()
+
+
+# ---------------------------------------------------------------------
+# AUTOMATIC PATIENT INFO EXTRACTION (heuristic, always user-verifiable)
+# ---------------------------------------------------------------------
+def extract_patient_info(text: str) -> dict:
+    """
+    Best-effort extraction of Name / Age / Sex from common lab report
+    layouts (including combined 'Age/Sex: 45/M' style fields used by
+    many labs). This is heuristic text pattern matching, not guaranteed
+    accurate — always shown to the user to verify/correct.
+    """
+    info = {}
+
+    combo = re.search(
+        r"age\s*/\s*sex\s*[:\-]?\s*(\d{1,3})\s*(?:y(?:rs|ears)?)?\s*/\s*(male|female|m|f)\b",
+        text, re.IGNORECASE,
+    )
+    if combo:
+        info["age"] = combo.group(1)
+        info["gender"] = combo.group(2)
+
+    if "age" not in info:
+        m = re.search(r"\bage\s*[:\-]\s*(\d{1,3})", text, re.IGNORECASE)
+        if m:
+            info["age"] = m.group(1)
+
+    if "gender" not in info:
+        m = re.search(r"\b(?:gender|sex)\s*[:\-]\s*(male|female|m|f)\b", text, re.IGNORECASE)
+        if m:
+            info["gender"] = m.group(1)
+
+    m = re.search(
+        r"(?:patient\s*name|name\s*of\s*patient|name)\s*[:\-]\s*([A-Za-z.'\- ]{2,50})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        candidate = m.group(1).strip()
+        candidate = re.split(r"\s{2,}", candidate)[0].strip()
+        if candidate:
+            info["name"] = candidate
+
+    if "gender" in info:
+        g = info["gender"].strip().lower()
+        info["gender"] = "Male" if g.startswith("m") else "Female"
+
+    if "age" in info:
+        try:
+            info["age"] = int(info["age"])
+        except ValueError:
+            info.pop("age", None)
+
+    return info
+
+
+# ---------------------------------------------------------------------
+# CHUNKING + FAISS
+# ---------------------------------------------------------------------
 def chunk_text(text: str, chunk_size: int = 220, overlap: int = 40):
     words = text.split()
     if not words:
@@ -317,14 +403,10 @@ def ask_groq(client, model, context, question, patient_context=""):
 
 
 # ---------------------------------------------------------------------
-# SIDEBAR — API KEY & MODEL
+# SIDEBAR — API KEY (hidden from visitors when set as a Streamlit secret)
 # ---------------------------------------------------------------------
 st.sidebar.header("⚙️ Settings")
 
-# Look for a key stored server-side (Streamlit Cloud "Secrets" or an
-# environment variable). If found, use it silently — visitors never see
-# an API key field at all. This is how you share the app with friends
-# without ever asking them for a key or exposing yours.
 _secret_key = None
 try:
     _secret_key = st.secrets.get("GROQ_API_KEY", None)
@@ -337,11 +419,10 @@ if _builtin_key:
     groq_api_key = _builtin_key
     st.sidebar.success("✅ Using the app's built-in API key — no key needed from you.")
 else:
-    # Fallback for local development only, when no secret is configured yet.
     groq_api_key = st.sidebar.text_input(
         "Groq API Key", type="password",
         help="No built-in key found. Get a free key at https://console.groq.com/keys "
-             "or, better, add it to Streamlit Cloud's Secrets so visitors never see this field."
+             "or add it to Streamlit Cloud's Secrets so visitors never see this field."
     )
 
 if "available_models" not in st.session_state:
@@ -363,84 +444,117 @@ st.sidebar.caption(
     "If a model errors with 'does not exist', click Refresh above, or check "
     "console.groq.com/docs/models — Groq periodically retires free-tier models."
 )
-
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    f"📚 {TOTAL_TEST_COUNT} lab tests available across "
-    f"{len(REFERENCE_RANGES)} categories. Embeddings run locally — only "
-    "retrieved text + your question are sent to Groq."
+    f"📚 {TOTAL_TEST_COUNT} lab tests across {len(REFERENCE_RANGES)} categories. "
+    "Embeddings and OCR run locally — only retrieved text + your question go to Groq."
 )
 
 # ---------------------------------------------------------------------
-# PATIENT CONTEXT — shared by both tabs, improves interpretation quality
+# PATIENT CONTEXT — shared by both tabs; auto-filled from uploads when
+# possible, always editable. Keys are pre-initialized so uploads can
+# update them via session_state before the widgets are drawn.
 # ---------------------------------------------------------------------
-with st.expander("🧍 Patient Context (optional, but recommended for a more relevant explanation)", expanded=True):
+_PC_DEFAULTS = {
+    "pc_name": "", "pc_age": 0, "pc_sex": "Male",
+    "pc_fasting": "Unknown", "pc_conditions": "", "pc_medications": "",
+}
+for _k, _v in _PC_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+with st.expander("🧍 Patient Context (auto-filled from uploads when possible — please verify)", expanded=True):
+    st.text_input("Patient Name (optional, kept local only — never sent to the AI)", key="pc_name")
     c1, c2, c3 = st.columns(3)
     with c1:
-        age = st.number_input("Age (years)", min_value=0, max_value=120, value=0, step=1)
+        st.number_input("Age (years)", min_value=0, max_value=120, step=1, key="pc_age")
     with c2:
-        sex = st.radio("Sex", ["Male", "Female"], horizontal=True)
+        st.radio("Sex", ["Male", "Female"], horizontal=True, key="pc_sex")
     with c3:
-        fasting = st.radio("Fasting for this test?", ["Unknown", "Yes", "No"], horizontal=True)
-
-    conditions = st.text_input(
-        "Known conditions / symptoms (optional)",
-        placeholder="e.g. type 2 diabetes, recent fever, family history of thyroid disease"
+        st.radio("Fasting for this test?", ["Unknown", "Yes", "No"], horizontal=True, key="pc_fasting")
+    st.text_input(
+        "Known conditions / symptoms (optional)", key="pc_conditions",
+        placeholder="e.g. type 2 diabetes, recent fever, family history of thyroid disease",
     )
-    medications = st.text_input(
-        "Current medications / supplements (optional)",
-        placeholder="e.g. metformin, levothyroxine, iron supplement"
+    st.text_input(
+        "Current medications / supplements (optional)", key="pc_medications",
+        placeholder="e.g. metformin, levothyroxine, iron supplement",
     )
 
-def build_patient_context_str():
+
+def build_patient_context_str() -> str:
     lines = []
-    if age and age > 0:
-        lines.append(f"Age: {age} years")
-    lines.append(f"Sex: {sex}")
-    if fasting != "Unknown":
-        lines.append(f"Fasting for this test: {fasting}")
-    if conditions.strip():
-        lines.append(f"Known conditions/symptoms: {conditions.strip()}")
-    if medications.strip():
-        lines.append(f"Current medications/supplements: {medications.strip()}")
+    if st.session_state.pc_age and st.session_state.pc_age > 0:
+        lines.append(f"Age: {st.session_state.pc_age} years")
+    lines.append(f"Sex: {st.session_state.pc_sex}")
+    if st.session_state.pc_fasting != "Unknown":
+        lines.append(f"Fasting for this test: {st.session_state.pc_fasting}")
+    if st.session_state.pc_conditions.strip():
+        lines.append(f"Known conditions/symptoms: {st.session_state.pc_conditions.strip()}")
+    if st.session_state.pc_medications.strip():
+        lines.append(f"Current medications/supplements: {st.session_state.pc_medications.strip()}")
     return "\n".join(lines)
 
-patient_context_str = build_patient_context_str()
 
 # ---------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
-if "index" not in st.session_state:
-    st.session_state.index = None
-if "manual_summary" not in st.session_state:
-    st.session_state.manual_summary = ""
+for _k, _v in {"chunks": [], "index": None, "manual_summary": "", "process_message": ""}.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 embedder = load_embedder()
 
 # ---------------------------------------------------------------------
 # TABS
 # ---------------------------------------------------------------------
-tab1, tab2 = st.tabs(["📄 Upload PDF Report", "✍️ Manual Entry (100+ tests)"])
+tab1, tab2 = st.tabs(["📄 Upload Report (PDF / Image)", "✍️ Manual Entry (100+ tests)"])
 
-# ------------------------- TAB 1: PDF -------------------------------
+# ------------------------- TAB 1: UPLOAD -----------------------------
 with tab1:
-    st.subheader("Upload your lab report (PDF)")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+    st.subheader("Upload your lab report — PDF, JPG, or PNG")
+    uploaded_file = st.file_uploader("Choose a file", type=["pdf", "jpg", "jpeg", "png"])
+
+    if st.session_state.process_message:
+        st.info(st.session_state.process_message)
 
     if uploaded_file is not None:
-        if st.button("Process PDF"):
-            with st.spinner("Extracting text, chunking, and building index..."):
-                raw_text = extract_text_from_pdf(uploaded_file)
-                chunks = chunk_text(raw_text)
-                if not chunks:
-                    st.error("Could not extract any text from this PDF. It may be a scanned image — try manual entry instead.")
+        if st.button("Process Report"):
+            with st.spinner("Extracting text (with OCR fallback if needed) and building index..."):
+                suffix = uploaded_file.name.lower().split(".")[-1]
+                if suffix == "pdf":
+                    raw_text = extract_text_from_pdf(uploaded_file)
                 else:
+                    raw_text = extract_text_from_image_file(uploaded_file)
+
+                if not raw_text or len(raw_text.strip()) < 5:
+                    st.error("Could not extract any readable text from this file. Try a clearer photo/scan, or use manual entry instead.")
+                else:
+                    chunks = chunk_text(raw_text)
                     index = build_faiss_index(chunks, embedder)
                     st.session_state.chunks = chunks
                     st.session_state.index = index
-                    st.success(f"Processed! Created {len(chunks)} text chunks from the report.")
+
+                    detected = extract_patient_info(raw_text)
+                    if "age" in detected:
+                        st.session_state.pc_age = detected["age"]
+                    if "gender" in detected:
+                        st.session_state.pc_sex = detected["gender"]
+                    if "name" in detected:
+                        st.session_state.pc_name = detected["name"]
+
+                    if detected:
+                        found = ", ".join(f"{k.title()}: {v}" for k, v in detected.items())
+                        st.session_state.process_message = (
+                            f"Processed! Created {len(chunks)} text chunks. "
+                            f"Auto-detected — {found}. Please verify in Patient Context above."
+                        )
+                    else:
+                        st.session_state.process_message = (
+                            f"Processed! Created {len(chunks)} text chunks. "
+                            "No patient details were auto-detected — please fill in Patient Context above manually."
+                        )
+                    st.rerun()
 
     if st.session_state.chunks:
         st.markdown("---")
@@ -460,7 +574,7 @@ with tab1:
                     context = "\n---\n".join(relevant)
                     client = get_groq_client(groq_api_key)
                     try:
-                        answer = ask_groq(client, model_choice, context, question, patient_context_str)
+                        answer = ask_groq(client, model_choice, context, question, build_patient_context_str())
                         st.markdown("### 🧾 Interpretation")
                         st.markdown(answer)
                     except Exception as e:
@@ -500,6 +614,7 @@ with tab2:
 
     if entries and st.button("Compute Status Table"):
         rows = []
+        sex = st.session_state.pc_sex
         for test, value, unit in entries:
             info = FLAT_TESTS[test]
             if "male" in info:
@@ -537,7 +652,7 @@ with tab2:
                     try:
                         answer = ask_groq(
                             client, model_choice, st.session_state.manual_summary,
-                            m_question, patient_context_str
+                            m_question, build_patient_context_str()
                         )
                         st.markdown("### 🧾 Interpretation")
                         st.markdown(answer)
@@ -546,8 +661,9 @@ with tab2:
 
 st.markdown("---")
 st.caption(
-    "Built with Streamlit, PyMuPDF, Sentence-Transformers, FAISS, and Groq. "
-    "Reference ranges are general adult values compiled from widely-published "
-    "clinical references and can vary by laboratory, analyzer, and method — "
-    "always check the range printed on your actual report."
+    "Built with Streamlit, PyMuPDF, Tesseract OCR, Sentence-Transformers, FAISS, and Groq. "
+    "Reference ranges are general adult values compiled from widely-published clinical "
+    "references and can vary by laboratory, analyzer, and method — always check the range "
+    "printed on your actual report. Auto-detected patient details are a best-effort text "
+    "match and should always be verified."
 )
