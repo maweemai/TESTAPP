@@ -463,6 +463,19 @@ for _k, _v in _PC_DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+# Apply any auto-detected patient info queued by the upload handler.
+# This MUST happen before the widgets below are instantiated — Streamlit
+# forbids writing to a widget's session_state key after that widget has
+# already been created in the current script run.
+if st.session_state.get("pending_detected"):
+    _pending = st.session_state.pop("pending_detected")
+    if "age" in _pending:
+        st.session_state.pc_age = _pending["age"]
+    if "gender" in _pending:
+        st.session_state.pc_sex = _pending["gender"]
+    if "name" in _pending:
+        st.session_state.pc_name = _pending["name"]
+
 with st.expander("🧍 Patient Context (auto-filled from uploads when possible — please verify)", expanded=True):
     st.text_input("Patient Name (optional, kept local only — never sent to the AI)", key="pc_name")
     c1, c2, c3 = st.columns(3)
@@ -536,12 +549,9 @@ with tab1:
                     st.session_state.index = index
 
                     detected = extract_patient_info(raw_text)
-                    if "age" in detected:
-                        st.session_state.pc_age = detected["age"]
-                    if "gender" in detected:
-                        st.session_state.pc_sex = detected["gender"]
-                    if "name" in detected:
-                        st.session_state.pc_name = detected["name"]
+                    # Queue it — applied at the top of the script on the
+                    # next run, before the Patient Context widgets exist.
+                    st.session_state.pending_detected = detected
 
                     if detected:
                         found = ", ".join(f"{k.title()}: {v}" for k, v in detected.items())
