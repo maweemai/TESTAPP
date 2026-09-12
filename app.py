@@ -238,10 +238,10 @@ def fetch_live_models(api_key: str):
 # ---------------------------------------------------------------------
 # OCR HELPERS
 # ---------------------------------------------------------------------
-def ocr_image(image: Image.Image) -> str:
+def ocr_image(image: Image.Image, psm: int = 6) -> str:
     """Run Tesseract OCR on a PIL image. Returns '' on failure with a UI warning."""
     try:
-        return pytesseract.image_to_string(image)
+        return pytesseract.image_to_string(image, config=f"--psm {psm}")
     except Exception as e:
         st.error(
             "OCR failed — Tesseract may not be installed in this environment. "
@@ -250,25 +250,35 @@ def ocr_image(image: Image.Image) -> str:
         return ""
 
 
-def extract_text_from_pdf(uploaded_file) -> str:
-    """Extract text from a PDF. Falls back to OCR page-by-page for scanned pages."""
+def extract_text_from_pdf(uploaded_file):
+    """
+    Extract text from a PDF, page by page. For each page, run BOTH native
+    text extraction and OCR, then keep whichever result is longer — this
+    protects against pages where a hidden/partial text layer exists but
+    is far less complete than what OCR can read off the rendered image.
+    Returns (line_preserving_text, cleaned_single_line_text).
+    """
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    parts = []
+    page_texts = []
     for page in doc:
-        page_text = page.get_text()
-        if len(page_text.strip()) < 20:  # likely a scanned/image-only page
-            pix = page.get_pixmap(dpi=200)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            page_text = ocr_image(img)
-        parts.append(page_text)
+        native_text = page.get_text()
+        pix = page.get_pixmap(dpi=300)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        ocr_text = ocr_image(img)
+        # Keep whichever extraction actually captured more content
+        page_texts.append(native_text if len(native_text.strip()) >= len(ocr_text.strip()) else ocr_text)
     doc.close()
-    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+    line_text = "\n".join(page_texts).strip()
+    cleaned_text = re.sub(r"\s+", " ", line_text).strip()
+    return line_text, cleaned_text
 
 
-def extract_text_from_image_file(uploaded_file) -> str:
+def extract_text_from_image_file(uploaded_file):
     """Extract text from a photo/scan (JPG/PNG) via OCR."""
     image = Image.open(uploaded_file).convert("RGB")
-    return re.sub(r"\s+", " ", ocr_image(image)).strip()
+    line_text = ocr_image(image).strip()
+    cleaned_text = re.sub(r"\s+", " ", line_text).strip()
+    return line_text, cleaned_text
 
 
 # ---------------------------------------------------------------------
