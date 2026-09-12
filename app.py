@@ -311,13 +311,20 @@ def extract_patient_info(text: str) -> dict:
         if m:
             info["gender"] = m.group(1)
 
+    # Conservative name extraction: OCR often places the next field (for example
+    # "Sample Date") on the same line as the name. Stop at common report labels.
     m = re.search(
-        r"(?:patient\s*name|name\s*of\s*patient|name)\s*[:\-]\s*([A-Za-z.'\- ]{2,50})",
+        r"(?:patient\s*name|name\s*of\s*patient|\bname)\s*[:\-]\s*"
+        r"([A-Za-z][A-Za-z.'\- ]{1,60}?)(?=\s+(?:sample\s+date|report\s+date|date|dob|age|sex|gender|patient\s*id|mrn|lab\s*no\.?|accession)\s*[:\-]?\b|$)",
         text, re.IGNORECASE,
     )
     if m:
-        candidate = m.group(1).strip()
-        candidate = re.split(r"\s{2,}", candidate)[0].strip()
+        candidate = m.group(1).strip(" .:-")
+        candidate = re.split(
+            r"\s+(?:sample\s+date|report\s+date|date|dob|age|sex|gender|"
+            r"patient\s*id|mrn|lab\s*no\.?|accession)\b",
+            candidate, maxsplit=1, flags=re.IGNORECASE,
+        )[0].strip(" .:-")
         if candidate:
             info["name"] = candidate
 
