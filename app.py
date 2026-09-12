@@ -557,7 +557,7 @@ with tab1:
                         found = ", ".join(f"{k.title()}: {v}" for k, v in detected.items())
                         st.session_state.process_message = (
                             f"Processed! Created {len(chunks)} text chunks. "
-                            f"Auto-detected — {found}. Please verify in Patient Context above."
+                            f"Auto-detected — {found}. Please analyze report."
                         )
                     else:
                         st.session_state.process_message = (
